@@ -1,0 +1,297 @@
+---
+title: "Customer Churn Modelling"
+author: "Ilaha Musayeva"
+date: "11.20.2023"
+---
+## Data Exploration and Preparing for Modelling
+
+```{r}
+# Load necessary libraries
+library(tidyverse)
+library(skimr)
+library(inspectdf)
+library(caret)
+library(glue)
+library(highcharter)
+library(h2o)
+library(scorecard)
+library(data.table)
+
+# Load the dataset using data.table
+df <- fread("CHURN.csv")
+
+# Explore the dataset
+df %>% glimpse()
+
+# Visualize the dataset in the RStudio Viewer
+View(df)
+
+# Explore missing values in the dataset
+df %>% inspect_na()
+
+# Check the number of unique values in the 'Geography' column
+df$Geography %>% n_unique()
+
+# Display column names
+colnames(df)
+
+# Remove unnecessary columns ('RowNumber', 'CustomerId', 'Surname')
+library(dplyr)
+df <- df %>% select(-RowNumber, -CustomerId, -Surname)
+View(df)
+
+# Check distribution of the target variable 'Exited'
+df$Exited %>% table() %>% prop.table()
+
+# Convert the target variable 'Exited' to a binary factor (0 or 1)
+df$Exited <- df$Exited %>% 
+  factor(levels = c('0', '1'),
+         labels = c(0, 1))
+
+# Information Value (IV) analysis
+iv <- df %>%
+  iv(y = "Exited") %>%
+  as_tibble() %>%
+  mutate(info_value = round(info_value, 3)) %>%
+  arrange(desc(info_value))
+
+# Select variables with IV greater than 0.02
+ivars <- iv %>%
+  filter(info_value > 0.02) %>%
+  select(variable) %>%
+  .[[1]]
+
+# Create a new dataframe with the selected variables
+df_iv <- df %>% select(Exited, ivars)
+
+# Display the dimensions of the new dataframe
+df_iv %>% dim()
+
+# Perform binning on the selected variables
+bins <- df_iv %>% woebin("Exited")
+
+# Separate numeric and character variables
+df_num <- df %>% select_if(is.numeric)
+df_chr <- df %>%
+  mutate_if(is.character, is.factor) %>%
+  select(Exited, everything())
+
+# Identify numeric variables with outliers
+num_vars <- df_num %>% names()
+
+for_vars <- c()
+for (b in 1:length(num_vars)) {
+  OutVals <- boxplot(df_num[[num_vars[b]]], plot = FALSE)$out
+  if (length(OutVals) > 0) {
+    for_vars[b] <- num_vars[b]
+  }
+}
+for_vars <- for_vars %>% as.data.frame() %>% drop_na() %>% pull(.) %>% as.character()
+for_vars %>% length()
+
+# Handle outliers in numeric variables
+for (o in for_vars) {
+  OutVals <- boxplot(df_num[[o]], plot = FALSE)$out
+  mean <- mean(df_num[[o]], na.rm = TRUE)
+  
+  o3 <- ifelse(OutVals > mean, OutVals, NA) %>% na.omit() %>% as.matrix() %>% .[, 1]
+  o1 <- ifelse(OutVals < mean, OutVals, NA) %>% na.omit() %>% as.matrix() %>% .[, 1]
+  
+  val3 <- quantile(df_num[[o]], 0.75, na.rm = TRUE) + 1.5 * IQR(df_num[[o]], na.rm = TRUE)
+  df_num[which(df_num[[o]] %in% o3), o] <- val3
+  
+  val1 <- quantile(df_num[[o]], 0.25, na.rm = TRUE) - 1.5 * IQR(df_num[[o]], na.rm = TRUE)
+  df_num[which(df_num[[o]] %in% o1), o] <- val1
+}
+
+# Create dummy variables for character variables
+dumm <- dummyVars(" ~ .", data = df_chr[, -1]) %>% 
+  predict(newdata = df_chr[, -1]) %>% 
+  as.data.frame()
+
+# Combine processed numeric and dummy variables
+df <- cbind(df_chr[, 1], dumm, df_num) 
+names(df) <- names(df) %>%
+  str_replace_all(" ","_") %>%
+  str_replace_all("-","_") %>%
+  str_replace_all("\\(","_") %>% 
+  str_replace_all("\\)","") %>%
+  str_replace_all("\\<=","LESS.EQUAL") %>%
+  str_replace_all("\\>=","MORE.EQUAL") %>%
+  str_replace_all("\\<","LESS") %>%
+  str_replace_all("\\>","MORE") %>%
+  str_replace_all("\\/","_") %>% 
+  str_replace_all("\\:","_") %>% 
+  str_replace_all("\\.","_") %>% 
+  str_replace_all("\\,","_")
+
+# Split the dataset into training and testing sets
+df_list <- df_iv %>%
+  split_df("Exited", ratio = 0.8, seed = 123)
+
+# Perform WoE transformation on training and testing sets
+train_woe <- df_list$train %>% woebin_ply(bins)
+test_woe <- df_list$test %>% woebin_ply(bins)
+
+# Get variable names after WoE transformation
+names <- train_woe %>% names()
+
+# Handle missing values after WoE transformation
+train_woe %>% inspect_na() %>% tail(2)
+test_woe %>% inspect_na() %>% tail(2)
+```
+## Modelling
+```{r}
+# Define target variable and feature names
+target <- "Exited"
+features <- train_woe %>% select(-Exited) %>% names()
+
+# Build logistic regression model using glm
+f <- as.formula(paste(target, paste(features, collapse = " + "), sep = " ~ "))
+glm <- glm(f, data = train_woe, family = "binomial")
+
+# Display summary of the logistic regression model
+glm %>% summary()
+
+# Remove non-significant variables based on p-values
+coef_na <- attributes(alias(glm)$Complete)$dimnames[[1]]
+features <- features[!features %in% coef_na]
+
+# Build a refined logistic regression model
+f <- as.formula(paste(target, paste(features, collapse = " + "), sep = " ~ "))
+glm <- glm(f, data = train_woe, family = "binomial")
+
+# Refine the model by removing variables with high VIF
+while (glm %>% vif() %>% arrange(desc(gvif)) %>% .[1, 2] >= 1.5) {
+  afterVIF <- glm %>% vif() %>% arrange(desc(gvif)) %>% .[-1, "variable"]
+  f <- as.formula(paste(target, paste(afterVIF, collapse = " + "), sep = " ~ "))
+  glm <- glm(f, data = train_woe, family = "binomial")
+}
+
+# Initialize H2O
+h2o.init()
+
+# Convert data to H2O frames
+train_h2o <- train_woe %>% select(target, features) %>% as.h2o()
+test_h2o <- test_woe %>% select(target, features) %>% as.h2o()
+
+# Build H2O GLM model with variable selection
+model <- h2o.glm(
+  x = features, y = target, family = "binomial", 
+  training_frame = train_h2o, validation_frame = test_h2o,
+  nfolds = 10, seed = 123, remove_collinear_columns = TRUE,
+  balance_classes = TRUE, lambda = 0, compute_p_values = TRUE)
+
+# Refine the model by removing non-significant variables iteratively
+while (model@model$coefficients_table %>%
+      as.data.frame() %>%
+      select(names, p_value) %>%
+      mutate(p_value = round(p_value, 3)) %>%
+      .[-1,] %>%
+      arrange(desc(p_value)) %>%
+      .[1, 2] >= 0.05) {
+  
+  model@model$coefficients_table %>%
+    as.data.frame() %>%
+    select(names, p_value) %>%
+    mutate(p_value = round(p_value, 3)) %>%
+    filter(!is.nan(p_value)) %>%
+    .[-1,] %>%
+    arrange(desc(p_value)) %>%
+    .[1, 1] -> v
+  
+  features <- features[features != v]
+  train_h2o <- train_woe %>% select(target, features) %>% as.h2o()
+  test_h2o <- test_woe %>% select(target, features) %>% as.h2o()
+  
+  model <- h2o.glm(
+    x = features, y = target, family = "binomial", 
+    training_frame = train_h2o, validation_frame = test_h2o,
+    nfolds = 10, seed = 123, remove_collinear_columns = TRUE,
+    balance_classes = TRUE, lambda = 0, compute_p_values = TRUE)
+}
+
+# Display the final coefficients table
+model@model$coefficients_table %>%
+  as.data.frame() %>%
+  select(names, p_value) %>%
+  mutate(p_value = round(p_value, 3))
+
+# Display variable importance using H2O's varimp function
+h2o.varimp(model) %>% as.data.frame() %>%
+  .[.$percentage != 0,] %>%
+  select(variable, percentage) %>%
+  hchart("pie", hcaes(x = variable, y = percentage)) %>%
+  hc_colors(colors = 'red') %>%
+  hc_xAxis(visible = TRUE) %>%
+  hc_yAxis(visible = TRUE)
+```
+## # Model Evaluation
+```{r}
+# Make predictions on the test set
+pred <- model %>% h2o.predict(newdata = test_h2o) %>% 
+  as.data.frame() %>% select(p1, predict)
+
+# Evaluate model performance using H2O's performance function
+model %>% h2o.performance(newdata = test_h2o) %>%
+  h2o.find_threshold_by_max_metric("f1")
+
+# Display the length of predictions
+length(pred)
+
+# View precision of the model
+model %>% h2o.performance(newdata = test_h2o) %>%
+  h2o.precision() %>% view()
+
+# Perform model evaluation using scorecard package
+eva <- perf_eva(
+  pred = pred %>% pull(p1),
+  label = df_list$test$Exited %>% as.character() %>% as.numeric(),
+  binomial_metric = c("auc", "gini"),
+  show_plot = "roc")
+
+# Display AUC and Gini values for the model
+eva
+
+# Display AUC and Gini values for train, test, and cross-validation
+model %>%
+  h2o.auc(train = TRUE,
+          valid = TRUE,
+          xval = TRUE) %>%
+  as_tibble() %>%
+  round(2) %>%
+  mutate(data = c('train', 'test', 'cross_val')) %>%
+  mutate(gini = 2 * value - 1) %>%
+  select(data, auc = value, gini)
+
+# Find threshold by max F1 score
+best_threshold <- model %>%
+  h2o.performance(newdata = test_h2o) %>%
+  h2o.find_threshold_by_max_metric("f1")
+
+cat("Best threshold for max F1 score:", best_threshold, "\n")
+
+# Display confusion matrix for the test set
+model %>%
+  h2o.confusionMatrix(test_h2o) %>%
+  as.tibble() %>%
+  select("0", "1") %>%
+  .[1:2,] %>%
+  t() %>%
+  fourfoldplot(conf.level = 0, color = c("red", "blue"),
+               main = paste("Accuracy = ",
+                            round(sum(diag(.))/sum(.)*100, 1), "%"))
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
