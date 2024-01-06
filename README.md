@@ -84,7 +84,7 @@ To replicate the analysis:
 
 ## Author
 
-- **Author:** [Your Name]
-- **Date:** [Date]
+- **Author:** Ilaha Musayeva
+- **Date:** 10/29/2023
 
 
